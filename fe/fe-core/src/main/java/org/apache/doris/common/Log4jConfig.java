@@ -31,10 +31,17 @@ import org.apache.logging.log4j.core.lookup.StrSubstitutor;
 import org.apache.logging.log4j.io.IoBuilder;
 
 import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.Properties;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 //
 // don't use trace. use INFO, WARN, ERROR, FATAL
@@ -67,6 +74,10 @@ public class Log4jConfig extends XmlConfiguration {
     private static final String AUDIT_FILE_LOGGER_PLACEHOLDER = "<!--REPLACED BY AUDIT FILE LOGGER-->";
     private static final String RUNTIME_LOG_MARKER_PLACEHOLDER = "<!--REPLACED BY RUNTIME LOG MARKER-->";
     private static final String AUDIT_LOG_MARKER_PLACEHOLDER = "<!--REPLACED BY AUDIT LOG MARKER-->";
+    // [fe-log-chinese-filter] message body, layout attribute, and optional RegexFilter for every appender
+    private static final String LOG_EVENT_PLACEHOLDER = "<!--REPLACED BY LOG EVENT-->";
+    private static final String LOG_FILTER_PLACEHOLDER = "<!--REPLACED BY LOG FILTER-->";
+    private static final String LOG_LAYOUT_ATTR_PLACEHOLDER = "<!--REPLACED BY LAYOUT ATTRS-->";
 
     // Appender names
     private static final String RUNTIME_LOG_CONSOLE_APPENDER = "Console";
@@ -78,9 +89,9 @@ public class Log4jConfig extends XmlConfiguration {
     // Log patterns
     private static final String RUNTIME_LOG_PATTERN
             = RUNTIME_LOG_MARKER_PLACEHOLDER + "%d{yyyy-MM-dd HH:mm:ss,SSS} %p (%t|%tid)"
-            + RUNTIME_LOG_FORMAT_PLACEHOLDER + "%m%n";
+            + RUNTIME_LOG_FORMAT_PLACEHOLDER + LOG_EVENT_PLACEHOLDER;
     private static final String AUDIT_LOG_PATTERN
-            = AUDIT_LOG_MARKER_PLACEHOLDER + "%d{yyyy-MM-dd HH:mm:ss,SSS} [%c{1}] %m%n";
+            = AUDIT_LOG_MARKER_PLACEHOLDER + "%d{yyyy-MM-dd HH:mm:ss,SSS} [%c{1}] " + LOG_EVENT_PLACEHOLDER;
 
     // Log markers
     private static final String RUNTIME_LOG_MARKER = "RuntimeLogger ";
@@ -94,17 +105,20 @@ public class Log4jConfig extends XmlConfiguration {
             .append("<Configuration status=\"info\" packages=\"org.apache.doris.common\">\n")
             .append("  <Appenders>\n")
             .append("    <Console name=\"" + RUNTIME_LOG_CONSOLE_APPENDER + "\" target=\"SYSTEM_OUT\">\n")
-            .append("      <PatternLayout charset=\"UTF-8\">\n")
+            .append("      " + LOG_FILTER_PLACEHOLDER + "\n")
+            .append("      <PatternLayout charset=\"UTF-8\"" + LOG_LAYOUT_ATTR_PLACEHOLDER + ">\n")
             .append("        <Pattern>" + RUNTIME_LOG_PATTERN + "</Pattern>\n")
             .append("      </PatternLayout>\n")
             .append("    </Console>\n")
             .append("    <Console name=\"" + AUDIT_LOG_CONSOLE_APPENDER + "\" target=\"SYSTEM_OUT\">\n")
-            .append("      <PatternLayout charset=\"UTF-8\">\n")
+            .append("      " + LOG_FILTER_PLACEHOLDER + "\n")
+            .append("      <PatternLayout charset=\"UTF-8\"" + LOG_LAYOUT_ATTR_PLACEHOLDER + ">\n")
             .append("        <Pattern>" + AUDIT_LOG_PATTERN + "</Pattern>\n")
             .append("      </PatternLayout>\n")
             .append("    </Console>\n")
             .append("    <RollingFile name=\"" + RUNTIME_LOG_FILE_APPENDER + "\" fileName=\"${sys_log_dir}/fe.log\" filePattern=\"${sys_log_dir}/fe.log.${sys_file_pattern}-%i${sys_file_postfix}\" immediateFlush=\"${immediate_flush_flag}\">\n")
-            .append("      <PatternLayout charset=\"UTF-8\">\n")
+            .append("      " + LOG_FILTER_PLACEHOLDER + "\n")
+            .append("      <PatternLayout charset=\"UTF-8\"" + LOG_LAYOUT_ATTR_PLACEHOLDER + ">\n")
             .append("        <Pattern>" + RUNTIME_LOG_PATTERN + "</Pattern>\n")
             .append("      </PatternLayout>\n")
             .append("      <Policies>\n")
@@ -122,7 +136,8 @@ public class Log4jConfig extends XmlConfiguration {
             .append("      </DefaultRolloverStrategy>\n")
             .append("    </RollingFile>\n")
             .append("    <RollingFile name=\"" + RUNTIME_LOG_WARN_FILE_APPENDER + "\" fileName=\"${sys_log_dir}/fe.warn.log\" filePattern=\"${sys_log_dir}/fe.warn.log.${sys_file_pattern}-%i${sys_file_postfix}\" immediateFlush=\"${immediate_flush_flag}\">\n")
-            .append("      <PatternLayout charset=\"UTF-8\">\n")
+            .append("      " + LOG_FILTER_PLACEHOLDER + "\n")
+            .append("      <PatternLayout charset=\"UTF-8\"" + LOG_LAYOUT_ATTR_PLACEHOLDER + ">\n")
             .append("        <Pattern>" + RUNTIME_LOG_PATTERN + "</Pattern>\n")
             .append("      </PatternLayout>\n")
             .append("      <Policies>\n")
@@ -140,7 +155,8 @@ public class Log4jConfig extends XmlConfiguration {
             .append("      </DefaultRolloverStrategy>\n")
             .append("    </RollingFile>\n")
             .append("    <RollingFile name=\"" + AUDIT_LOG_FILE_APPENDER + "\" fileName=\"${audit_log_dir}/fe.audit.log\" filePattern=\"${audit_log_dir}/fe.audit.log.${audit_file_pattern}-%i${audit_file_postfix}\">\n")
-            .append("      <PatternLayout charset=\"UTF-8\">\n")
+            .append("      " + LOG_FILTER_PLACEHOLDER + "\n")
+            .append("      <PatternLayout charset=\"UTF-8\"" + LOG_LAYOUT_ATTR_PLACEHOLDER + ">\n")
             .append("        <Pattern>" + AUDIT_LOG_PATTERN + "</Pattern>\n")
             .append("      </PatternLayout>\n")
             .append("      <Policies>\n")
@@ -192,6 +208,116 @@ public class Log4jConfig extends XmlConfiguration {
     //     If doris is not running under daemon mode, then this variable == true, and console logger will be added to
     //     loggers, all logs will be printed to console.
     public static boolean foreground = false;
+
+    // ---- [fe-log-chinese-filter] ----
+    // Read here from fe.conf / fe_custom.conf (or a -D system property) so only Log4jConfig.class is replaced.
+    // ConfigBase ignores unknown keys, so these keys are harmless for an unpatched FE.
+    //   fe_log_filter_chinese      = none | strip | drop   (default: strip)
+    //       none : original behaviour
+    //       strip: remove Han / CJK punctuation from each Log4j event, including the rendered throwable
+    //       drop : discard the event when its formatted message contains a match
+    //   fe_log_chinese_replacement = text that replaces each matched run in strip mode (default: empty)
+    //   fe_log_chinese_regex       = advanced: Java regex of what counts as "Chinese"
+    // Applies to every appender this class generates (Console, Sys, SysWF, AuditConsole, AuditFile).
+    // fe.out, JVM GC logs, and other streams this configuration does not own are unchanged.
+    public static final String LOG_FILTER_MODE_KEY = "fe_log_filter_chinese";
+    public static final String LOG_FILTER_REPLACEMENT_KEY = "fe_log_chinese_replacement";
+    public static final String LOG_FILTER_REGEX_KEY = "fe_log_chinese_regex";
+    public static final String DEFAULT_LOG_FILTER_MODE = "strip";
+    public static final String DEFAULT_LOG_CHINESE_REGEX = "[\\p{IsHan}\\p{InCJKSymbolsAndPunctuation}"
+            + "\\p{InHalfwidthAndFullwidthForms}\\p{InCJKCompatibilityForms}\\p{InBopomofo}]+";
+    private static String logFilterMode = DEFAULT_LOG_FILTER_MODE;
+    private static String logChineseReplacement = "";
+    private static String logChineseRegex = DEFAULT_LOG_CHINESE_REGEX;
+
+    static void loadLogFilterConf(String dorisConfDir, String customDir) throws IOException {
+        Properties props = new Properties();
+        if (dorisConfDir != null) {
+            loadProps(props, new File(dorisConfDir, "fe.conf"));
+        }
+        if (customDir != null) {
+            // fe_custom.conf overrides fe.conf, same as ConfigBase
+            loadProps(props, new File(customDir, "fe_custom.conf"));
+        }
+        String mode = System.getProperty(LOG_FILTER_MODE_KEY, props.getProperty(LOG_FILTER_MODE_KEY));
+        String repl = System.getProperty(LOG_FILTER_REPLACEMENT_KEY, props.getProperty(LOG_FILTER_REPLACEMENT_KEY));
+        String regex = System.getProperty(LOG_FILTER_REGEX_KEY, props.getProperty(LOG_FILTER_REGEX_KEY));
+
+        mode = (mode == null || mode.trim().isEmpty()) ? DEFAULT_LOG_FILTER_MODE : mode.trim().toLowerCase();
+        if (!(mode.equals("none") || mode.equals("strip") || mode.equals("drop"))) {
+            throw new IOException(LOG_FILTER_MODE_KEY + " config error: " + mode + ", must be none/strip/drop");
+        }
+        repl = repl == null ? "" : repl.trim();
+        if (repl.matches(".*[{}%$\\\\].*")) {
+            throw new IOException(LOG_FILTER_REPLACEMENT_KEY + " must not contain { } % $ or \\ : " + repl);
+        }
+        regex = (regex == null || regex.trim().isEmpty()) ? DEFAULT_LOG_CHINESE_REGEX : regex.trim();
+        try {
+            Pattern.compile(regex);
+        } catch (PatternSyntaxException e) {
+            throw new IOException(LOG_FILTER_REGEX_KEY + " config error: " + e.getMessage());
+        }
+        if (regex.contains("$") || regex.contains("%") || !bracesBalanced(regex)) {
+            throw new IOException(LOG_FILTER_REGEX_KEY + " must not contain $ or %, and braces must be balanced");
+        }
+        logFilterMode = mode;
+        logChineseReplacement = repl;
+        logChineseRegex = regex;
+        LogUtils.stdout("fe log chinese filter: mode=" + mode + ", replacement='" + repl + "', regex=" + regex);
+    }
+
+    private static void loadProps(Properties props, File f) throws IOException {
+        if (!f.isFile()) {
+            return;
+        }
+        try (Reader r = new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8)) {
+            props.load(r);
+        }
+    }
+
+    private static boolean bracesBalanced(String s) {
+        int depth = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                if (--depth < 0) {
+                    return false;
+                }
+            }
+        }
+        return depth == 0;
+    }
+
+    private static String xmlEscape(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    // %replace does not implement handlesThrowable(), so Log4j 2.18 would append a second, unfiltered
+    // ExtendedThrowable (%xEx) after the layout. Strip mode renders %xEx inside %replace and disables that.
+    static String logLayoutAttrs() {
+        if (logFilterMode.equals("strip")) {
+            return " alwaysWriteExceptions=\"false\"";
+        }
+        return "";
+    }
+
+    // none/drop keep the original %m%n tail (implicit %xEx still follows). strip filters message and throwable.
+    static String logEventPattern() {
+        if (logFilterMode.equals("strip")) {
+            return xmlEscape("%replace{%m%n%xEx}{" + logChineseRegex + "}{" + logChineseReplacement + "}");
+        }
+        return "%m%n";
+    }
+
+    static String logFilterElement() {
+        if (logFilterMode.equals("drop")) {
+            return "<RegexFilter regex=\"" + xmlEscape("(?s).*(?:" + logChineseRegex + ").*")
+                    + "\" useRawMsg=\"false\" onMatch=\"DENY\" onMismatch=\"NEUTRAL\"/>";
+        }
+        return "";
+    }
 
     private static void reconfig() throws IOException {
         String newXmlConfTemplate = xmlConfTemplateBuilder.toString();
@@ -310,6 +436,11 @@ public class Log4jConfig extends XmlConfiguration {
         strSub = new StrSubstitutor(new Interpolator(properties));
         newXmlConfTemplate = strSub.replace(newXmlConfTemplate);
 
+        // [fe-log-chinese-filter] after ${} substitution, String.replace (not replaceAll) keeps regex backslashes.
+        newXmlConfTemplate = newXmlConfTemplate.replace(LOG_LAYOUT_ATTR_PLACEHOLDER, logLayoutAttrs());
+        newXmlConfTemplate = newXmlConfTemplate.replace(LOG_EVENT_PLACEHOLDER, logEventPattern());
+        newXmlConfTemplate = newXmlConfTemplate.replace(LOG_FILTER_PLACEHOLDER, logFilterElement());
+
         LogUtils.stdout("=====\n" + newXmlConfTemplate + "\n=====");
         logXmlConfTemplate = newXmlConfTemplate;
         SpringLog4j2Config.writeSpringLogConf(customConfDir);
@@ -376,6 +507,7 @@ public class Log4jConfig extends XmlConfiguration {
         auditModules = Config.audit_log_modules;
         confDir = dorisConfDir;
         customConfDir = Config.custom_config_dir;
+        loadLogFilterConf(confDir, customConfDir);
         reconfig();
     }
 
